@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { ensurePage } from './lib/browser.mjs'
 import {
   confirmPublish, deleteCookies, favoriteFeed, fetchDetail, fetchFeeds, likeFeed, loginQrcode,
-  loginState, postComment, publishContent, replyComment, searchFeeds, userProfile,
+  loginState, postComment, publishContent, publishVideo, replyComment, searchFeeds, userProfile,
 } from './lib/xhs.mjs'
 
 const PORT = Number(process.env.MCP_PORT || 18060)
@@ -168,8 +168,7 @@ const TOOLS = [
       required: ['title', 'content', 'video'],
     },
     run: async ({ page, args }) => {
-      if (!args.video || !/^\//.test(args.video)) throw Object.assign(new Error('video 需要本机绝对路径（可先用 POST /upload 上传拿到 path）'), { status: 400 })
-      await stat(args.video).catch(() => { throw Object.assign(new Error(`视频文件不存在：${args.video}`), { status: 400 }) })
+
       const result = await publishVideo(page, args)
       if (args.confirm) return { ...result, ...(await confirmPublish(page)) }
       return result
@@ -177,29 +176,10 @@ const TOOLS = [
   },
 ]
 
-/** 视频发布：上传视频后填标题正文。 */
-async function publishVideo(page, { title, content, video, tags = [], visibility = '公开可见' }) {
-  const { goto } = await import('./lib/xhs.mjs')
-  await goto(page, 'https://creator.xiaohongshu.com/publish/publish?source=official', { wait: 3500 })
-  if (!page.url().includes('creator.xiaohongshu.com')) throw Object.assign(new Error('创作中心需要登录（先用 get_login_qrcode 扫码）'), { status: 401 })
-  await page.evaluate(() => {
-    const tab = [...document.querySelectorAll('.creator-tab, .tab, [class*="tab"]')].find(el => /视频/.test(el.innerText ?? ''))
-    tab?.click()
-  })
-  await new Promise(r => setTimeout(r, 1200))
-  const input = await page.$('input[type=file]')
-  if (!input) throw Object.assign(new Error('没找到上传视频的输入框（创作中心结构可能变了）'), { status: 409 })
-  await input.uploadFile(video)
-  await new Promise(r => setTimeout(r, 8000))
-  const tagText = tags.map(tag => `#${String(tag).replace(/^#/, '')}`).join(' ')
-  await page.evaluate(({ t, body }) => {
-    const titleEl = document.querySelector('.d-text input, .title input, input[placeholder*="标题"]')
-    const bodyEl = document.querySelector('.ql-editor, [contenteditable="true"]')
-    if (titleEl) { titleEl.focus(); titleEl.value = t; titleEl.dispatchEvent(new Event('input', { bubbles: true })) }
-    if (bodyEl) { bodyEl.focus(); bodyEl.innerText = body; bodyEl.dispatchEvent(new Event('input', { bubbles: true })) }
-  }, { t: title, body: tagText ? `${content}\n${tagText}` : content })
-  return { success: true, stage: 'ready_to_publish', visibility, note: '视频已上传并填好，确认后点「发布」' }
-}
+// 工具级短缓存：同样的搜索/首页在 TTL 内直接复用，避免重复整页导航
+const CACHE = new Map()
+const CACHE_TTL = Number(process.env.XHS_CACHE_TTL ?? 20000)
+const CACHEABLE = new Set(['list_feeds', 'search_feeds'])
 
 let chain = Promise.resolve()
 /** 所有工具调用串行执行：浏览器只有一个标签页。 */
@@ -212,10 +192,18 @@ function serialize(task) {
 async function callTool(name, args) {
   const tool = TOOLS.find(row => row.name === name)
   if (!tool) throw Object.assign(new Error(`未知工具 ${name}`), { status: 400 })
-  return serialize(async () => {
+  const payload = args ?? {}
+  const cacheKey = `${name}:${JSON.stringify(payload)}`
+  if (CACHEABLE.has(name) && CACHE_TTL > 0) {
+    const hit = CACHE.get(cacheKey)
+    if (hit && hit.expires > Date.now()) return { ...hit.value, cached: true }
+  }
+  const result = await serialize(async () => {
     const page = await ensurePage()
-    return tool.run({ page, args: args ?? {} })
+    return tool.run({ page, args: payload })
   })
+  if (CACHEABLE.has(name) && CACHE_TTL > 0) CACHE.set(cacheKey, { expires: Date.now() + CACHE_TTL, value: result })
+  return result
 }
 
 function textResult(payload, isError = false) {
@@ -291,27 +279,38 @@ async function pruneUploads() {
 }
 
 /** 小红书 CDN 有防盗链，浏览器直连会 403：这里带 Referer 代取，再吐给工作台。 */
-async function proxyImage(res, target) {
+async function proxyImage(res, target, req) {
   if (!/^https?:\/\//.test(String(target ?? ''))) {
     res.writeHead(400, CORS).end('bad url')
     return
   }
   try {
+    // 视频要支持 Range，否则浏览器拖动进度条会失败
+    const range = req?.headers?.range
     const upstream = await fetch(target, {
-      headers: { referer: 'https://www.xiaohongshu.com/', 'user-agent': IMG_UA, accept: 'image/avif,image/webp,image/*,*/*' },
-      signal: AbortSignal.timeout(20000),
+      headers: {
+        referer: 'https://www.xiaohongshu.com/',
+        'user-agent': IMG_UA,
+        accept: 'image/avif,image/webp,image/*,video/*,*/*',
+        ...(range ? { range } : {}),
+      },
+      signal: AbortSignal.timeout(30000),
     })
-    if (!upstream.ok) {
+    if (!upstream.ok && upstream.status !== 206) {
       res.writeHead(502, CORS).end(`upstream ${upstream.status}`)
       return
     }
     const buf = Buffer.from(await upstream.arrayBuffer())
-    res.writeHead(200, {
+    const headers = {
       ...CORS,
       'content-type': upstream.headers.get('content-type') ?? 'image/jpeg',
       'cache-control': 'public, max-age=3600',
+      'accept-ranges': 'bytes',
       'content-length': buf.length,
-    }).end(buf)
+    }
+    const contentRange = upstream.headers.get('content-range')
+    if (contentRange) headers['content-range'] = contentRange
+    res.writeHead(upstream.status === 206 ? 206 : 200, headers).end(buf)
   } catch (err) {
     res.writeHead(502, CORS).end(`fetch failed: ${err.message}`)
   }
@@ -324,7 +323,7 @@ const server = createServer(async (req, res) => {
     return
   }
   if (url.pathname === '/img') {
-    await proxyImage(res, url.searchParams.get('u'))
+    await proxyImage(res, url.searchParams.get('u'), req)
     return
   }
   if (url.pathname === '/upload' && req.method === 'POST') {
@@ -418,6 +417,17 @@ pruneUploads().catch(() => {})
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`xiaohongshu-mcp(node) listening on http://127.0.0.1:${PORT}/mcp  tools=${TOOLS.length}${TOKEN ? ' (token required)' : ''}`)
+  // 预热：提前把浏览器和首页拉起来，别让第一次工具调用等浏览器启动
+  ;(async () => {
+    try {
+      const page = await ensurePage()
+      const { goto } = await import('./lib/xhs.mjs')
+      await goto(page, 'https://www.xiaohongshu.com/explore', { wait: 500, timeout: 45000 })
+      console.log('[warmup] 浏览器与首页就绪')
+    } catch (err) {
+      console.error('[warmup] 预热失败（不影响使用）:', err.message)
+    }
+  })()
 })
 
 // 退出时收尾
