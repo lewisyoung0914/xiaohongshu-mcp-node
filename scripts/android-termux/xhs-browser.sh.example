@@ -1,0 +1,17 @@
+#!/system/bin/sh
+# Android / Termux 上的浏览器启动器示例。
+# 前提：按 docs/android-termux.md 把 Termux 的 chromium 解包到 $PREFIX_STAGED，
+#       并用 termuxpath.c 编译出垫片（修 Chromium 里写死的 /apex、/data/data/com.termux 资源路径）。
+PREFIX_STAGED=${XHS_TERMUX_PREFIX:-$HOME/chromium-prefix/data/data/com.termux/files/usr}
+SHIM=${XHS_PATH_SHIM:-$HOME/chromium-prefix/patched/termuxpath.so}
+APP_PREFIX=${PREFIX:-/data/data/com.termux/files/usr}
+
+export LD_LIBRARY_PATH="$PREFIX_STAGED/lib:$APP_PREFIX/lib"
+export LD_PRELOAD="$SHIM"
+export DSH_TERMUX_PREFIX_MAP="$PREFIX_STAGED"
+
+exec "$PREFIX_STAGED/lib/chromium/headless_shell" \
+  --headless --no-sandbox --no-zygote --single-process --disable-gpu \
+  --disable-dev-shm-usage --hide-scrollbars --mute-audio \
+  --disable-background-networking --no-first-run \
+  "$@"

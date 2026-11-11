@@ -1,0 +1,40 @@
+{
+  "name": "xiaohongshu-mcp-node",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Xiaohongshu (RedNote) MCP server in Node.js — drives a local Chrome/Chromium with puppeteer-core and exposes the same MCP protocol and tools as xiaohongshu-mcp.",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "call": "node call.mjs",
+    "login:qr": "node call.mjs get_login_qrcode '{}'",
+    "login:phone": "node login-phone.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "xiaohongshu",
+    "rednote",
+    "puppeteer",
+    "deepseek-harness"
+  ],
+  "files": [
+    "server.mjs",
+    "call.mjs",
+    "login-phone.mjs",
+    "lib",
+    "scripts",
+    "docs",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer-core": "^24.43.1"
+  }
+}
